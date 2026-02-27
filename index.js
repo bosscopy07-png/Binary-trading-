@@ -11,15 +11,15 @@ const CONFIG = {
   TELEGRAM: {
     TOKEN: process.env.BOT_TOKEN,
     CHAT_ID: process.env.CHANNEL_ID,
-    ADMIN_ID: process.env.ADMIN_CHAT_ID, // For error alerts
+    ADMIN_ID: process.env.ADMIN_CHAT_ID || null, // Optional
   },
   TRADING: {
     PAIRS: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "XAUUSD"],
     TIMEFRAME: "1 Hour (H1)",
     EXPIRY_MIN: 60,
     PRE_ALERT_MIN: 30,
-    MIN_CONFIDENCE: 75, // Minimum confidence % to send signal
-    RISK_PER_TRADE: 2, // Risk percentage per trade
+    MIN_CONFIDENCE: 75,
+    RISK_PER_TRADE: 2,
   },
   PROMO: {
     LINK: process.env.PROMO_LINK || "https://lkjz.pro/6b1d",
@@ -27,8 +27,7 @@ const CONFIG = {
   },
   API: {
     TWELVEDATA_KEY: process.env.TWELVEDATA_KEY,
-    FALLBACK_APIS: ["twelvedata", "forexapi"], // Backup data sources
-    RATE_LIMIT_DELAY: 1200, // ms between API calls
+    RATE_LIMIT_DELAY: 1200,
   },
 };
 
@@ -62,13 +61,16 @@ class TradeManager {
   }
 
   addTrade(tradeId, tradeData) {
+    const expiryTime = Date.now() + (CONFIG.TRADING.EXPIRY_MIN * 60 * 1000);
     this.activeTrades.set(tradeId, {
       ...tradeData,
       createdAt: new Date(),
       status: "pending",
+      expiryTime: expiryTime,
     });
     this.dailyStats.sent++;
     this.lastSignalTime.set(tradeData.pair, Date.now());
+    logger.info(`Trade added: ${tradeId}, expires at ${new Date(expiryTime).toISOString()}`);
   }
 
   updateTrade(tradeId, result) {
@@ -82,6 +84,8 @@ class TradeManager {
       
       if (result.outcome === "win") this.dailyStats.won++;
       else if (result.outcome === "loss") this.dailyStats.lost++;
+      
+      logger.info(`Trade closed: ${tradeId}, Result: ${result.outcome}`);
     }
   }
 
@@ -100,6 +104,7 @@ class TradeManager {
 
   resetDailyStats() {
     this.dailyStats = { sent: 0, won: 0, lost: 0, pending: 0 };
+    logger.info("Daily stats reset");
   }
 }
 
@@ -124,7 +129,7 @@ class TelegramService {
       };
 
       const response = await axios.post(`${this.baseUrl}/sendMessage`, payload);
-      logger.info(`Message sent successfully`);
+      logger.info(`Message sent successfully to ${payload.chat_id}`);
       return response.data;
     } catch (error) {
       logger.error("Telegram send failed:", error.message);
@@ -171,6 +176,11 @@ class TelegramService {
   }
 
   async sendAlert(title, message, priority = "normal") {
+    if (!CONFIG.TELEGRAM.ADMIN_ID) {
+      logger.warn("ADMIN_ID not set, skipping alert");
+      return;
+    }
+    
     const emoji = priority === "high" ? "🚨" : priority === "medium" ? "⚠️" : "ℹ️";
     const text = `
 <b>${emoji} ${title}</b>
@@ -200,7 +210,7 @@ class MarketDataService {
         return response.data;
       } catch (error) {
         if (i === retries - 1) throw error;
-        logger.warn(`Retry ${i + 1} for ${url}`);
+        logger.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
         await new Promise((r) => setTimeout(r, 2000 * (i + 1)));
       }
     }
@@ -216,61 +226,57 @@ class MarketDataService {
     }
 
     try {
-      // Try AlphaVantage first
-      const data = await this.fetchAlphaVantage(pair);
+      const data = await this.fetchTwelveData(pair);
       this.cache.set(cacheKey, { data, timestamp: Date.now() });
       return data;
     } catch (error) {
-      logger.error(`TWELVEDATA for ${pair}:`, error.message);
-      // Fallback to alternative source
-      return await this.fetchFallbackData(pair);
+      logger.error(`TwelveData failed for ${pair}: ${error.message}`);
+      throw error;
     }
   }
 
-  async fetchAlphaVantage(pair) {
-    if (!CONFIG.TWELVEDATA_KEY) {
-      throw new Error("AlphaVantage API key not configured");
+  async fetchTwelveData(pair) {
+    if (!CONFIG.API.TWELVEDATA_KEY) {
+      throw new Error("TWELVEDATA_KEY not configured in .env file");
     }
 
-    const fromSymbol = pair.slice(0, 3);
-    const toSymbol = pair.slice(3) || "USD";
+    // Format pair for TwelveData (e.g., EUR/USD)
+    const formattedPair = pair.length === 6 ? `${pair.slice(0,3)}/${pair.slice(3)}` : pair;
     
-    const url = `https://api.twelvedata.com/time_series?symbol=${pair}&interval=1h&outputsize=200&apikey=${process.env.TWELVEDATA_KEY}`;
+    const url = `https://api.twelvedata.com/time_series?symbol=${formattedPair}&interval=1h&outputsize=200&apikey=${CONFIG.API.TWELVEDATA_KEY}`;
     
+    logger.info(`Fetching data for ${pair} from TwelveData`);
     const data = await this.fetchWithRetry(url);
-    const timeSeries = data["Time Series FX (60min)"] || data["Time Series (Digital Currency Hourly)"];
     
-    if (!timeSeries) {
-      throw new Error("Invalid data format from AlphaVantage");
+    if (data.status === 'error') {
+      throw new Error(`TwelveData API error: ${data.message}`);
+    }
+    
+    if (!data.values || !Array.isArray(data.values)) {
+      throw new Error("Invalid data format from TwelveData: missing values array");
     }
 
-    return this.parseTimeSeries(timeSeries);
+    return this.parseTwelveData(data);
   }
 
-  parseTimeSeries(timeSeries) {
-    const entries = Object.entries(timeSeries)
-      .sort(([a], [b]) => new Date(a) - new Date(b))
-      .slice(-250); // Last 250 candles
-
+  parseTwelveData(data) {
+    // TwelveData returns values in reverse chronological order (newest first)
+    // We need to reverse it to oldest first for technical indicators
+    const values = [...data.values].reverse();
+    
     return {
-      timestamps: entries.map(([time]) => time),
-      opens: entries.map(([, v]) => parseFloat(v["1. open"])),
-      highs: entries.map(([, v]) => parseFloat(v["2. high"])),
-      lows: entries.map(([, v]) => parseFloat(v["3. low"])),
-      closes: entries.map(([, v]) => parseFloat(v["4. close"])),
-      volumes: entries.map(([, v]) => parseFloat(v["5. volume"] || 0)),
+      timestamps: values.map(v => v.datetime),
+      opens: values.map(v => parseFloat(v.open)),
+      highs: values.map(v => parseFloat(v.high)),
+      lows: values.map(v => parseFloat(v.low)),
+      closes: values.map(v => parseFloat(v.close)),
+      volumes: values.map(v => parseFloat(v.volume || 0)),
     };
-  }
-
-  async fetchFallbackData(pair) {
-    // Implement TwelveData or other fallback
-    logger.info(`Using fallback data for ${pair}`);
-    // Placeholder for fallback implementation
-    throw new Error("Fallback data source not implemented");
   }
 
   clearCache() {
     this.cache.clear();
+    logger.info("Cache cleared");
   }
 }
 
@@ -279,26 +285,31 @@ const marketData = new MarketDataService();
 // ==================== TECHNICAL ANALYSIS ====================
 class TechnicalAnalyzer {
   analyze(data) {
-    const { closes, highs, lows, opens } = data;
+    const { closes, highs, lows } = data;
     
-    if (closes.length < 200) {
-      return { valid: false, reason: "Insufficient data" };
+    if (!closes || closes.length < 200) {
+      return { valid: false, reason: `Insufficient data: ${closes?.length || 0} candles, need 200` };
     }
 
-    const indicators = this.calculateIndicators(closes, highs, lows);
-    const signals = this.generateSignals(indicators, closes);
-    const confidence = this.calculateConfidence(indicators, signals, closes);
+    try {
+      const indicators = this.calculateIndicators(closes, highs, lows);
+      const signals = this.generateSignals(indicators, closes);
+      const confidence = this.calculateConfidence(indicators, signals, closes);
 
-    return {
-      valid: true,
-      signal: signals.direction,
-      confidence,
-      indicators,
-      entryPrice: closes[closes.length - 1],
-      stopLoss: this.calculateStopLoss(closes, signals.direction),
-      takeProfit: this.calculateTakeProfit(closes, signals.direction),
-      analysis: signals.reasoning,
-    };
+      return {
+        valid: true,
+        signal: signals.direction,
+        confidence,
+        indicators: { ...indicators, trend: signals.trend },
+        entryPrice: closes[closes.length - 1],
+        stopLoss: this.calculateStopLoss(closes, signals.direction),
+        takeProfit: this.calculateTakeProfit(closes, signals.direction),
+        analysis: signals.reasoning,
+      };
+    } catch (error) {
+      logger.error("Analysis error:", error.message);
+      return { valid: false, reason: `Analysis failed: ${error.message}` };
+    }
   }
 
   calculateIndicators(closes, highs, lows) {
@@ -326,7 +337,6 @@ class TechnicalAnalyzer {
 
   generateSignals(ind, closes) {
     const lastClose = closes[closes.length - 1];
-    const prevClose = closes[closes.length - 2];
     
     const lastEma20 = ind.ema20[ind.ema20.length - 1];
     const lastEma50 = ind.ema50[ind.ema50.length - 1];
@@ -336,7 +346,6 @@ class TechnicalAnalyzer {
     
     const lastRSI = ind.rsi[ind.rsi.length - 1];
     const lastMACD = ind.macd[ind.macd.length - 1];
-    
     const lastBB = ind.bb[ind.bb.length - 1];
 
     let score = 0;
@@ -405,24 +414,17 @@ class TechnicalAnalyzer {
   }
 
   calculateConfidence(indicators, signals, closes) {
-    // Multi-factor confidence calculation
     let confidence = Math.min(signals.score, 100);
     
-    // Adjust based on trend strength
-    const adx = this.calculateADX(closes);
-    if (adx > 25) confidence += 10;
+    // Adjust based on trend alignment
+    if (signals.direction === "CALL" && signals.trend === "bullish") confidence += 5;
+    if (signals.direction === "PUT" && signals.trend === "bearish") confidence += 5;
     
-    // Adjust based on volume (if available)
     // Adjust based on confluence
     const confluence = signals.reasoning.split(",").length;
-    confidence += confluence * 5;
+    confidence += confluence * 3;
 
     return Math.min(confidence, 100);
-  }
-
-  calculateADX(closes) {
-    // Simplified ADX calculation
-    return 20; // Placeholder
   }
 
   calculateStopLoss(closes, direction) {
@@ -442,12 +444,14 @@ class TechnicalAnalyzer {
   }
 
   calculateATR(closes, period = 14) {
-    // Simplified ATR
+    if (closes.length < period + 1) return closes[closes.length - 1] * 0.001;
+    
     const highs = closes.map((c, i) => i > 0 ? Math.max(c, closes[i-1]) : c);
     const lows = closes.map((c, i) => i > 0 ? Math.min(c, closes[i-1]) : c);
     const trs = highs.map((h, i) => h - lows[i]);
     const atr = trs.slice(-period).reduce((a, b) => a + b, 0) / period;
-    return atr || lastClose * 0.001;
+    
+    return atr || closes[closes.length - 1] * 0.001;
   }
 }
 
@@ -585,6 +589,8 @@ class BinarySignalBot {
     if (missing.length > 0) {
       throw new Error(`Missing required env vars: ${missing.join(", ")}`);
     }
+    
+    logger.info("Configuration validated successfully");
   }
 
   scheduleTasks() {
@@ -615,6 +621,7 @@ class BinarySignalBot {
     });
 
     this.scheduledTasks = [signalTask, preAlertTask, resultTask, reportTask, cleanupTask];
+    logger.info("Scheduled tasks initialized");
   }
 
   async runSignalCycle() {
@@ -623,9 +630,10 @@ class BinarySignalBot {
     
     for (const pair of CONFIG.TRADING.PAIRS) {
       try {
-        // Check cooldown (avoid duplicate signals)
+        // Check cooldown (avoid duplicate signals within 1 hour)
         const lastSignal = tradeManager.lastSignalTime.get(pair);
         if (lastSignal && timestamp - lastSignal < 3600000) {
+          logger.info(`Skipping ${pair}: cooldown active`);
           continue;
         }
 
@@ -656,7 +664,7 @@ class BinarySignalBot {
         logger.info(`Signal sent for ${pair}: ${analysis.signal} (${analysis.confidence}%)`);
 
       } catch (error) {
-                logger.error(`Error processing ${pair}:`, error);
+        logger.error(`Error processing ${pair}:`, error.message);
         await telegram.sendAlert("Signal Error", `Pair: ${pair}\nError: ${error.message}`, "high");
       }
     }
@@ -664,18 +672,23 @@ class BinarySignalBot {
 
   async runPreAlertCycle() {
     logger.info("Running pre-alert scan");
-    // Analyze next potential signals
+    
     for (const pair of CONFIG.TRADING.PAIRS) {
       try {
+        // Check if we already have a pending trade for this pair
+        const hasPending = Array.from(tradeManager.activeTrades.values()).some(t => t.pair === pair);
+        if (hasPending) continue;
+
         const data = await marketData.getForexData(pair);
         const analysis = analyzer.analyze(data);
         
         if (analysis.valid && analysis.signal && analysis.confidence >= CONFIG.TRADING.MIN_CONFIDENCE + 10) {
           const message = MessageBuilder.preAlert(pair, analysis);
           await telegram.sendMessage(message);
+          logger.info(`Pre-alert sent for ${pair}: ${analysis.signal}`);
         }
       } catch (error) {
-        logger.error(`Pre-alert error for ${pair}:`, error);
+        logger.error(`Pre-alert error for ${pair}:`, error.message);
       }
     }
   }
@@ -696,7 +709,7 @@ class BinarySignalBot {
         
         if (isCall) {
           outcome = currentPrice > trade.entryPrice ? "win" : "loss";
-          pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * 50; // Leveraged
+          pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * 50;
         } else {
           outcome = currentPrice < trade.entryPrice ? "win" : "loss";
           pnl = ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100 * 50;
@@ -712,7 +725,7 @@ class BinarySignalBot {
         await telegram.sendMessage(message);
 
       } catch (error) {
-        logger.error(`Error checking result for ${tradeId}:`, error);
+        logger.error(`Error checking result for ${tradeId}:`, error.message);
       }
     }
   }
@@ -720,6 +733,7 @@ class BinarySignalBot {
   async sendDailyReport() {
     const message = MessageBuilder.dailyReport();
     await telegram.sendMessage(message);
+    logger.info("Daily report sent");
   }
 
   stop() {
@@ -736,6 +750,16 @@ const bot = new BinarySignalBot();
 process.on("SIGTERM", () => bot.stop());
 process.on("SIGINT", () => bot.stop());
 
+// Handle uncaught errors
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught Exception:", error);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
 // Start the bot
 bot.start().catch((error) => {
   logger.error("Failed to start bot:", error);
@@ -743,3 +767,4 @@ bot.start().catch((error) => {
 });
 
 export default bot;
+  
