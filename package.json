@@ -1,0 +1,32 @@
+{
+  "name": "binary-signal-bot",
+  "version": "1.0.0",
+  "description": "Automated binary options trading signal bot with technical analysis",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "trading",
+    "binary-options",
+    "forex",
+    "signals",
+    "telegram-bot",
+    "technical-analysis"
+  ],
+  "author": "bossdestiny",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1",
+    "technicalindicators": "^3.1.0",
+    "winston": "^3.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
