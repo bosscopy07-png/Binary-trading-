@@ -26,7 +26,7 @@ const CONFIG = {
     CODE: process.env.PROMO_CODE || "Bossdestiny",
   },
   API: {
-    ALPHAVANTAGE_KEY: process.env.ALPHAVANTAGE_KEY,
+    TWELVEDATA_KEY: process.env.TWELVEDATA_KEY,
     FALLBACK_APIS: ["twelvedata", "forexapi"], // Backup data sources
     RATE_LIMIT_DELAY: 1200, // ms between API calls
   },
@@ -221,21 +221,21 @@ class MarketDataService {
       this.cache.set(cacheKey, { data, timestamp: Date.now() });
       return data;
     } catch (error) {
-      logger.error(`AlphaVantage failed for ${pair}:`, error.message);
+      logger.error(`TWELVEDATA for ${pair}:`, error.message);
       // Fallback to alternative source
       return await this.fetchFallbackData(pair);
     }
   }
 
   async fetchAlphaVantage(pair) {
-    if (!CONFIG.API.ALPHAVANTAGE_KEY) {
+    if (!CONFIG.TWELVEDATA_KEY) {
       throw new Error("AlphaVantage API key not configured");
     }
 
     const fromSymbol = pair.slice(0, 3);
     const toSymbol = pair.slice(3) || "USD";
     
-    const url = `https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=${fromSymbol}&to_symbol=${toSymbol}&interval=60min&outputsize=full&apikey=${CONFIG.API.ALPHAVANTAGE_KEY}`;
+    const url = `https://api.twelvedata.com/time_series?symbol=${pair}&interval=1h&outputsize=200&apikey=${process.env.TWELVEDATA_KEY}`;
     
     const data = await this.fetchWithRetry(url);
     const timeSeries = data["Time Series FX (60min)"] || data["Time Series (Digital Currency Hourly)"];
