@@ -579,7 +579,7 @@ class BinarySignalBot {
   }
 
   async validateConfig() {
-    const required = ["BOT_TOKEN", "CHANNEL_ID", "ALPHAVANTAGE_KEY"];
+    const required = ["BOT_TOKEN", "CHANNEL_ID", "TWELVEDATA_KEY"];
     const missing = required.filter((key) => !process.env[key]);
     
     if (missing.length > 0) {
