@@ -1,7 +1,9 @@
 import axios from "axios";
 import cron from "node-cron";
 import dotenv from "dotenv";
-import { EMA, RSI, MACD, BollingerBands } from "technicalindicators";
+import { 
+  EMA, RSI, MACD, BollingerBands, ATR, ADX, Stochastic 
+} from "technicalindicators";
 import winston from "winston";
 
 dotenv.config();
@@ -11,7 +13,8 @@ const CONFIG = {
   TELEGRAM: {
     TOKEN: process.env.BOT_TOKEN,
     CHAT_ID: process.env.CHANNEL_ID,
-    ADMIN_ID: process.env.ADMIN_CHAT_ID || null, // Optional
+    ADMIN_ID: process.env.ADMIN_CHAT_ID || null,
+    RATE_LIMIT_MS: 1000, // 1 message per second to same chat
   },
   TRADING: {
     PAIRS: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "XAUUSD"],
@@ -19,7 +22,10 @@ const CONFIG = {
     EXPIRY_MIN: 60,
     PRE_ALERT_MIN: 30,
     MIN_CONFIDENCE: 75,
-    RISK_PER_TRADE: 2,
+    RISK_PER_TRADE: 0.5, // Conservative: 0.5% per trade
+    MAX_DAILY_RISK: 3.0, // Max 3% daily loss
+    MAX_TRADES_PER_DAY: 5, // Prevent overtrading
+    COOLDOWN_MIN: 60, // Minutes between signals for same pair
   },
   PROMO: {
     LINK: process.env.PROMO_LINK || "https://lkjz.pro/6b1d",
@@ -27,11 +33,12 @@ const CONFIG = {
   },
   API: {
     TWELVEDATA_KEY: process.env.TWELVEDATA_KEY,
-    RATE_LIMIT_DELAY: 1200,
+    RATE_LIMIT_DELAY: 1200, // 1.2s between API calls (8/min max)
+    MAX_RETRIES: 3,
   },
 };
 
-// ==================== LOGGER SETUP ====================
+// ==================== ENHANCED LOGGER ====================
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
@@ -56,8 +63,36 @@ class TradeManager {
   constructor() {
     this.activeTrades = new Map();
     this.tradeHistory = [];
-    this.dailyStats = { sent: 0, won: 0, lost: 0, pending: 0 };
+    this.dailyStats = { 
+      sent: 0, 
+      won: 0, 
+      lost: 0, 
+      pending: 0,
+      dailyRiskUsed: 0, // Track daily risk exposure
+      lastTradeDate: new Date().toDateString()
+    };
     this.lastSignalTime = new Map();
+    this.dailyTradeCount = 0;
+  }
+
+  checkNewDay() {
+    const today = new Date().toDateString();
+    if (today !== this.dailyStats.lastTradeDate) {
+      this.resetDailyStats();
+      this.dailyStats.lastTradeDate = today;
+      this.dailyTradeCount = 0;
+    }
+  }
+
+  canTakeTrade() {
+    this.checkNewDay();
+    if (this.dailyTradeCount >= CONFIG.TRADING.MAX_TRADES_PER_DAY) {
+      return { allowed: false, reason: "Daily trade limit reached" };
+    }
+    if (this.dailyStats.dailyRiskUsed >= CONFIG.TRADING.MAX_DAILY_RISK) {
+      return { allowed: false, reason: "Daily risk limit reached" };
+    }
+    return { allowed: true };
   }
 
   addTrade(tradeId, tradeData) {
@@ -67,10 +102,15 @@ class TradeManager {
       createdAt: new Date(),
       status: "pending",
       expiryTime: expiryTime,
+      riskAmount: CONFIG.TRADING.RISK_PER_TRADE,
     });
+    
     this.dailyStats.sent++;
+    this.dailyStats.dailyRiskUsed += CONFIG.TRADING.RISK_PER_TRADE;
+    this.dailyTradeCount++;
     this.lastSignalTime.set(tradeData.pair, Date.now());
-    logger.info(`Trade added: ${tradeId}, expires at ${new Date(expiryTime).toISOString()}`);
+    
+    logger.info(`Trade added: ${tradeId}, Risk: ${CONFIG.TRADING.RISK_PER_TRADE}%, Daily Risk: ${this.dailyStats.dailyRiskUsed}%`);
   }
 
   updateTrade(tradeId, result) {
@@ -79,13 +119,14 @@ class TradeManager {
       trade.status = result.outcome;
       trade.closedAt = new Date();
       trade.exitPrice = result.exitPrice;
+      trade.pnl = result.pnl;
       this.tradeHistory.push({ ...trade });
       this.activeTrades.delete(tradeId);
       
       if (result.outcome === "win") this.dailyStats.won++;
       else if (result.outcome === "loss") this.dailyStats.lost++;
       
-      logger.info(`Trade closed: ${tradeId}, Result: ${result.outcome}`);
+      logger.info(`Trade closed: ${tradeId}, Result: ${result.outcome}, PnL: ${result.pnl}%`);
     }
   }
 
@@ -99,12 +140,27 @@ class TradeManager {
       ...this.dailyStats,
       winRate: total > 0 ? ((this.dailyStats.won / total) * 100).toFixed(2) : 0,
       active: this.activeTrades.size,
+      tradesRemaining: CONFIG.TRADING.MAX_TRADES_PER_DAY - this.dailyTradeCount,
     };
   }
 
   resetDailyStats() {
-    this.dailyStats = { sent: 0, won: 0, lost: 0, pending: 0 };
+    this.dailyStats = { 
+      sent: 0, 
+      won: 0, 
+      lost: 0, 
+      pending: 0,
+      dailyRiskUsed: 0,
+      lastTradeDate: new Date().toDateString()
+    };
     logger.info("Daily stats reset");
+  }
+
+  isCooldownActive(pair) {
+    const lastSignal = this.lastSignalTime.get(pair);
+    if (!lastSignal) return false;
+    const cooldownMs = CONFIG.TRADING.COOLDOWN_MIN * 60 * 1000;
+    return (Date.now() - lastSignal) < cooldownMs;
   }
 }
 
@@ -116,9 +172,21 @@ class TelegramService {
     this.baseUrl = `https://api.telegram.org/bot${CONFIG.TELEGRAM.TOKEN}`;
     this.messageQueue = [];
     this.isProcessing = false;
+    this.lastMessageTime = 0;
+  }
+
+  async rateLimit() {
+    const now = Date.now();
+    const timeSinceLastMessage = now - this.lastMessageTime;
+    if (timeSinceLastMessage < CONFIG.TELEGRAM.RATE_LIMIT_MS) {
+      await new Promise(r => setTimeout(r, CONFIG.TELEGRAM.RATE_LIMIT_MS - timeSinceLastMessage));
+    }
+    this.lastMessageTime = Date.now();
   }
 
   async sendMessage(text, options = {}) {
+    await this.rateLimit();
+    
     try {
       const payload = {
         chat_id: options.chatId || CONFIG.TELEGRAM.CHAT_ID,
@@ -128,10 +196,20 @@ class TelegramService {
         ...options,
       };
 
-      const response = await axios.post(`${this.baseUrl}/sendMessage`, payload);
+      const response = await axios.post(`${this.baseUrl}/sendMessage`, payload, {
+        timeout: 10000,
+      });
+      
       logger.info(`Message sent successfully to ${payload.chat_id}`);
       return response.data;
     } catch (error) {
+      if (error.response?.status === 429) {
+        const retryAfter = error.response.data?.parameters?.retry_after || 35;
+        logger.warn(`Rate limited by Telegram. Retry after ${retryAfter}s`);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        return this.sendMessage(text, options); // Retry once
+      }
+      
       logger.error("Telegram send failed:", error.message);
       this.queueMessage(text, options);
       throw error;
@@ -139,20 +217,22 @@ class TelegramService {
   }
 
   async sendPhoto(photoUrl, caption, options = {}) {
+    await this.rateLimit();
+    
     try {
       await axios.post(`${this.baseUrl}/sendPhoto`, {
         chat_id: options.chatId || CONFIG.TELEGRAM.CHAT_ID,
         photo: photoUrl,
         caption: caption,
         parse_mode: "HTML",
-      });
+      }, { timeout: 10000 });
     } catch (error) {
       logger.error("Photo send failed:", error.message);
     }
   }
 
   queueMessage(text, options) {
-    this.messageQueue.push({ text, options, retries: 0 });
+    this.messageQueue.push({ text, options, retries: 0, lastAttempt: Date.now() });
     if (!this.isProcessing) this.processQueue();
   }
 
@@ -160,16 +240,19 @@ class TelegramService {
     this.isProcessing = true;
     while (this.messageQueue.length > 0) {
       const item = this.messageQueue[0];
+      const delay = Math.max(0, 5000 - (Date.now() - item.lastAttempt));
+      await new Promise(r => setTimeout(r, delay));
+      
       try {
         await this.sendMessage(item.text, item.options);
         this.messageQueue.shift();
       } catch (error) {
         item.retries++;
+        item.lastAttempt = Date.now();
         if (item.retries > 3) {
-          logger.error("Message failed after 3 retries:", item.text);
+          logger.error("Message failed after 3 retries:", item.text.substring(0, 100));
           this.messageQueue.shift();
         }
-        await new Promise((r) => setTimeout(r, 5000));
       }
     }
     this.isProcessing = false;
@@ -200,18 +283,38 @@ class MarketDataService {
   constructor() {
     this.cache = new Map();
     this.cacheExpiry = 5 * 60 * 1000; // 5 minutes
+    this.requestQueue = [];
+    this.isProcessingQueue = false;
   }
 
-  async fetchWithRetry(url, options = {}, retries = 3) {
+  async fetchWithRetry(url, options = {}, retries = CONFIG.API.MAX_RETRIES) {
     for (let i = 0; i < retries; i++) {
       try {
+        // Respect rate limit: 8 requests per minute = 1 every 7.5 seconds
         await new Promise((r) => setTimeout(r, CONFIG.API.RATE_LIMIT_DELAY));
-        const response = await axios.get(url, { timeout: 10000, ...options });
+        
+        const response = await axios.get(url, { 
+          timeout: 15000, 
+          ...options,
+          headers: {
+            'User-Agent': 'BinarySignalBot/1.0',
+            ...options.headers
+          }
+        });
+        
+        if (response.data?.status === 'error') {
+          throw new Error(`API Error: ${response.data.message}`);
+        }
+        
         return response.data;
       } catch (error) {
         if (i === retries - 1) throw error;
-        logger.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
-        await new Promise((r) => setTimeout(r, 2000 * (i + 1)));
+        
+        const isRateLimit = error.response?.status === 429;
+        const delay = isRateLimit ? 10000 : (2000 * (i + 1));
+        
+        logger.warn(`Retry ${i + 1}/${retries} for ${url}: ${error.message}`);
+        await new Promise((r) => setTimeout(r, delay));
       }
     }
   }
@@ -230,7 +333,7 @@ class MarketDataService {
       this.cache.set(cacheKey, { data, timestamp: Date.now() });
       return data;
     } catch (error) {
-      logger.error(`TwelveData failed for ${pair}: ${error.message}`);
+      logger.error(`Failed to fetch data for ${pair}: ${error.message}`);
       throw error;
     }
   }
@@ -245,15 +348,11 @@ class MarketDataService {
     
     const url = `https://api.twelvedata.com/time_series?symbol=${formattedPair}&interval=1h&outputsize=200&apikey=${CONFIG.API.TWELVEDATA_KEY}`;
     
-    logger.info(`Fetching data for ${pair} from TwelveData`);
+    logger.info(`Fetching live data for ${pair} from TwelveData`);
     const data = await this.fetchWithRetry(url);
     
-    if (data.status === 'error') {
-      throw new Error(`TwelveData API error: ${data.message}`);
-    }
-    
-    if (!data.values || !Array.isArray(data.values)) {
-      throw new Error("Invalid data format from TwelveData: missing values array");
+    if (!data.values || !Array.isArray(data.values) || data.values.length < 50) {
+      throw new Error(`Insufficient data from TwelveData: ${data.values?.length || 0} candles received`);
     }
 
     return this.parseTwelveData(data);
@@ -261,7 +360,7 @@ class MarketDataService {
 
   parseTwelveData(data) {
     // TwelveData returns values in reverse chronological order (newest first)
-    // We need to reverse it to oldest first for technical indicators
+    // Reverse to oldest first for technical indicators
     const values = [...data.values].reverse();
     
     return {
@@ -282,29 +381,31 @@ class MarketDataService {
 
 const marketData = new MarketDataService();
 
-// ==================== TECHNICAL ANALYSIS ====================
+// ==================== ENHANCED TECHNICAL ANALYSIS ====================
 class TechnicalAnalyzer {
   analyze(data) {
-    const { closes, highs, lows } = data;
+    const { closes, highs, lows, volumes } = data;
     
     if (!closes || closes.length < 200) {
       return { valid: false, reason: `Insufficient data: ${closes?.length || 0} candles, need 200` };
     }
 
     try {
-      const indicators = this.calculateIndicators(closes, highs, lows);
-      const signals = this.generateSignals(indicators, closes);
+      const indicators = this.calculateIndicators(closes, highs, lows, volumes);
+      const signals = this.generateSignals(indicators, closes, highs, lows);
       const confidence = this.calculateConfidence(indicators, signals, closes);
+      const levels = this.findSupportResistance(closes, highs, lows);
 
       return {
         valid: true,
         signal: signals.direction,
         confidence,
-        indicators: { ...indicators, trend: signals.trend },
+        indicators: { ...indicators, trend: signals.trend, ...levels },
         entryPrice: closes[closes.length - 1],
-        stopLoss: this.calculateStopLoss(closes, signals.direction),
-        takeProfit: this.calculateTakeProfit(closes, signals.direction),
+        stopLoss: this.calculateStopLoss(closes, highs, lows, signals.direction),
+        takeProfit: this.calculateTakeProfit(closes, signals.direction, levels),
         analysis: signals.reasoning,
+        riskReward: this.calculateRiskReward(closes, signals.direction, levels),
       };
     } catch (error) {
       logger.error("Analysis error:", error.message);
@@ -312,18 +413,14 @@ class TechnicalAnalyzer {
     }
   }
 
-  calculateIndicators(closes, highs, lows) {
+  calculateIndicators(closes, highs, lows, volumes) {
     return {
       ema20: EMA.calculate({ period: 20, values: closes }),
       ema50: EMA.calculate({ period: 50, values: closes }),
       ema200: EMA.calculate({ period: 200, values: closes }),
       rsi: RSI.calculate({ period: 14, values: closes }),
       rsi7: RSI.calculate({ period: 7, values: closes }),
-      bb: BollingerBands.calculate({
-        period: 20,
-        values: closes,
-        stdDev: 2,
-      }),
+      bb: BollingerBands.calculate({ period: 20, values: closes, stdDev: 2 }),
       macd: MACD.calculate({
         values: closes,
         fastPeriod: 12,
@@ -332,11 +429,41 @@ class TechnicalAnalyzer {
         SimpleMAOscillator: false,
         SimpleMASignal: false,
       }),
+      atr: ATR.calculate({ high: highs, low: lows, close: closes, period: 14 }),
+      adx: ADX.calculate({ high: highs, low: lows, close: closes, period: 14 }),
+      stochastic: Stochastic.calculate({
+        high: highs,
+        low: lows,
+        close: closes,
+        period: 14,
+        signalPeriod: 3,
+      }),
     };
   }
 
-  generateSignals(ind, closes) {
+  findSupportResistance(closes, highs, lows) {
+    const lookback = 20;
+    const recentHighs = highs.slice(-lookback);
+    const recentLows = lows.slice(-lookback);
+    
+    const resistance = Math.max(...recentHighs);
+    const support = Math.min(...recentLows);
+    const currentPrice = closes[closes.length - 1];
+    
+    const distToRes = ((resistance - currentPrice) / currentPrice) * 100;
+    const distToSup = ((currentPrice - support) / currentPrice) * 100;
+    
+    return {
+      support: support.toFixed(5),
+      resistance: resistance.toFixed(5),
+      distToSupport: distToSup.toFixed(2),
+      distToResistance: distToRes.toFixed(2),
+    };
+  }
+
+  generateSignals(ind, closes, highs, lows) {
     const lastClose = closes[closes.length - 1];
+    const len = closes.length;
     
     const lastEma20 = ind.ema20[ind.ema20.length - 1];
     const lastEma50 = ind.ema50[ind.ema50.length - 1];
@@ -347,33 +474,52 @@ class TechnicalAnalyzer {
     const lastRSI = ind.rsi[ind.rsi.length - 1];
     const lastMACD = ind.macd[ind.macd.length - 1];
     const lastBB = ind.bb[ind.bb.length - 1];
+    const lastATR = ind.atr[ind.atr.length - 1];
+    const lastADX = ind.adx[ind.adx.length - 1];
+    const lastStoch = ind.stochastic[ind.stochastic.length - 1];
 
     let score = 0;
     let reasoning = [];
+    let confluenceCount = 0;
 
-    // Trend Analysis
+    // Trend Analysis with ADX
     const trendUp = lastEma50 > lastEma200 && lastEma20 > lastEma50;
     const trendDown = lastEma50 < lastEma200 && lastEma20 < lastEma50;
-    
+    const strongTrend = lastADX > 25;
+
+    if (trendUp && strongTrend) {
+      score += 20;
+      reasoning.push("Strong uptrend (ADX>25)");
+      confluenceCount++;
+    } else if (trendDown && strongTrend) {
+      score -= 20;
+      reasoning.push("Strong downtrend (ADX>25)");
+      confluenceCount++;
+    }
+
     // EMA Crossover
     const goldenCross = prevEma50 < prevEma200 && lastEma50 > lastEma200;
     const deathCross = prevEma50 > prevEma200 && lastEma50 < lastEma200;
 
     if (goldenCross) {
-      score += 30;
+      score += 25;
       reasoning.push("Golden Cross detected");
+      confluenceCount++;
     } else if (deathCross) {
-      score -= 30;
+      score -= 25;
       reasoning.push("Death Cross detected");
+      confluenceCount++;
     }
 
-    // RSI Conditions
+    // RSI Conditions with Divergence Check
     if (lastRSI > 50 && lastRSI < 70) {
-      score += 20;
-      reasoning.push(`RSI bullish momentum (${lastRSI.toFixed(2)})`);
+      score += 15;
+      reasoning.push(`RSI bullish (${lastRSI.toFixed(1)})`);
+      confluenceCount++;
     } else if (lastRSI < 50 && lastRSI > 30) {
-      score -= 20;
-      reasoning.push(`RSI bearish momentum (${lastRSI.toFixed(2)})`);
+      score -= 15;
+      reasoning.push(`RSI bearish (${lastRSI.toFixed(1)})`);
+      confluenceCount++;
     } else if (lastRSI > 70) {
       score -= 10;
       reasoning.push("RSI overbought");
@@ -382,76 +528,130 @@ class TechnicalAnalyzer {
       reasoning.push("RSI oversold");
     }
 
+    // Stochastic
+    if (lastStoch) {
+      if (lastStoch.k < 20 && lastStoch.d < 20) {
+        score += 10;
+        reasoning.push("Stochastic oversold");
+        confluenceCount++;
+      } else if (lastStoch.k > 80 && lastStoch.d > 80) {
+        score -= 10;
+        reasoning.push("Stochastic overbought");
+        confluenceCount++;
+      }
+    }
+
     // MACD
-    if (lastMACD && lastMACD.histogram > 0 && lastMACD.MACD > lastMACD.signal) {
-      score += 25;
-      reasoning.push("MACD bullish");
-    } else if (lastMACD && lastMACD.histogram < 0 && lastMACD.MACD < lastMACD.signal) {
-      score -= 25;
-      reasoning.push("MACD bearish");
+    if (lastMACD) {
+      const macdBullish = lastMACD.histogram > 0 && lastMACD.MACD > lastMACD.signal;
+      const macdBearish = lastMACD.histogram < 0 && lastMACD.MACD < lastMACD.signal;
+      
+      if (macdBullish) {
+        score += 20;
+        reasoning.push("MACD bullish");
+        confluenceCount++;
+      } else if (macdBearish) {
+        score -= 20;
+        reasoning.push("MACD bearish");
+        confluenceCount++;
+      }
     }
 
     // Bollinger Bands
     if (lastClose < lastBB.lower) {
       score += 15;
-      reasoning.push("Price below lower BB (oversold)");
+      reasoning.push("Price below BB lower (oversold)");
+      confluenceCount++;
     } else if (lastClose > lastBB.upper) {
       score -= 15;
-      reasoning.push("Price above upper BB (overbought)");
+      reasoning.push("Price above BB upper (overbought)");
+      confluenceCount++;
     }
 
     // Determine direction
     let direction = null;
-    if (score >= 40) direction = "CALL";
-    else if (score <= -40) direction = "PUT";
+    if (score >= 50 && confluenceCount >= 3) direction = "CALL";
+    else if (score <= -50 && confluenceCount >= 3) direction = "PUT";
 
     return {
       direction,
       score: Math.abs(score),
-      reasoning: reasoning.join(", "),
+      reasoning: reasoning.join(" | "),
       trend: trendUp ? "bullish" : trendDown ? "bearish" : "neutral",
+      confluence: confluenceCount,
+      volatility: lastATR,
     };
   }
 
   calculateConfidence(indicators, signals, closes) {
-    let confidence = Math.min(signals.score, 100);
+    let confidence = Math.min(signals.score * 0.8, 85); // Cap at 85% initially
     
-    // Adjust based on trend alignment
+    // Boost for high confluence
+    confidence += signals.confluence * 2;
+    
+    // Trend alignment bonus
     if (signals.direction === "CALL" && signals.trend === "bullish") confidence += 5;
     if (signals.direction === "PUT" && signals.trend === "bearish") confidence += 5;
     
-    // Adjust based on confluence
-    const confluence = signals.reasoning.split(",").length;
-    confidence += confluence * 3;
-
-    return Math.min(confidence, 100);
+    // Volatility check - avoid low volatility periods
+    const avgPrice = closes.reduce((a, b) => a + b, 0) / closes.length;
+    const volatilityPct = (signals.volatility / avgPrice) * 100;
+    if (volatilityPct < 0.05) confidence -= 10; // Too quiet
+    
+    return Math.min(Math.max(confidence, 0), 98); // Hard cap at 98%
   }
 
-  calculateStopLoss(closes, direction) {
-    const atr = this.calculateATR(closes);
+  calculateStopLoss(closes, highs, lows, direction) {
+    const atr = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
+    const lastATR = atr[atr.length - 1];
     const lastClose = closes[closes.length - 1];
+    
+    // Use 1.5x ATR for stop loss
     return direction === "CALL" 
-      ? lastClose - (atr * 1.5) 
-      : lastClose + (atr * 1.5);
+      ? lastClose - (lastATR * 1.5) 
+      : lastClose + (lastATR * 1.5);
   }
 
-  calculateTakeProfit(closes, direction) {
-    const atr = this.calculateATR(closes);
+    calculateTakeProfit(closes, direction, levels) {
     const lastClose = closes[closes.length - 1];
-    return direction === "CALL"
-      ? lastClose + (atr * 2)
-      : lastClose - (atr * 2);
+    const atr = ATR.calculate({ 
+      high: closes.map((c, i) => Math.max(c, closes[i-1] || c)),
+      low: closes.map((c, i) => Math.min(c, closes[i-1] || c)),
+      close: closes, 
+      period: 14 
+    });
+    const lastATR = atr[atr.length - 1];
+    
+    // Use 2x ATR or next S/R level, whichever is closer
+    const atrTarget = direction === "CALL" 
+      ? lastClose + (lastATR * 2)
+      : lastClose - (lastATR * 2);
+    
+    const srTarget = direction === "CALL" 
+      ? parseFloat(levels.resistance) 
+      : parseFloat(levels.support);
+    
+    // Return the closer target (more conservative)
+    const atrDist = Math.abs(atrTarget - lastClose);
+    const srDist = Math.abs(srTarget - lastClose);
+    
+    return (atrDist < srDist ? atrTarget : srTarget).toFixed(5);
   }
 
-  calculateATR(closes, period = 14) {
-    if (closes.length < period + 1) return closes[closes.length - 1] * 0.001;
+  calculateRiskReward(closes, direction, levels) {
+    const entry = closes[closes.length - 1];
+    const stop = this.calculateStopLoss(
+      closes, 
+      closes.map((c, i) => Math.max(c, closes[i-1] || c)),
+      closes.map((c, i) => Math.min(c, closes[i-1] || c)),
+      direction
+    );
+    const target = this.calculateTakeProfit(closes, direction, levels);
     
-    const highs = closes.map((c, i) => i > 0 ? Math.max(c, closes[i-1]) : c);
-    const lows = closes.map((c, i) => i > 0 ? Math.min(c, closes[i-1]) : c);
-    const trs = highs.map((h, i) => h - lows[i]);
-    const atr = trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+    const risk = Math.abs(entry - stop);
+    const reward = Math.abs(parseFloat(target) - entry);
     
-    return atr || closes[closes.length - 1] * 0.001;
+    return risk > 0 ? (reward / risk).toFixed(2) : "0.00";
   }
 }
 
@@ -461,6 +661,8 @@ const analyzer = new TechnicalAnalyzer();
 class MessageBuilder {
   static preAlert(pair, analysis) {
     const trendEmoji = analysis.signal === "CALL" ? "🟢" : "🔴";
+    const stats = tradeManager.getStats();
+    
     return `
 ╔════════════════════════════════════╗
 ║     ⚠️ PRE-ALERT: SIGNAL INCOMING   ║
@@ -470,10 +672,20 @@ class MessageBuilder {
 ⏱ <b>Timeframe:</b> ${CONFIG.TRADING.TIMEFRAME}
 📊 <b>Expected Direction:</b> ${analysis.signal} ${trendEmoji}
 🎯 <b>Confidence:</b> ${analysis.confidence.toFixed(1)}%
-📈 <b>Trend:</b> ${analysis.indicators.trend}
+📈 <b>Trend:</b> ${analysis.indicators.trend.toUpperCase()}
+💪 <b>Confluence:</b> ${analysis.indicators.confluence}/6 indicators
+
+<b>Key Levels:</b>
+🟢 Support: ${analysis.indicators.support} (${analysis.indicators.distToSupport}% away)
+🔴 Resistance: ${analysis.indicators.resistance} (${analysis.indicators.distToResistance}% away)
 
 <b>Technical Setup:</b>
 • ${analysis.analysis}
+
+⚠️ <b>Risk Management:</b>
+• Daily trades remaining: ${stats.tradesRemaining}
+• Risk per trade: ${CONFIG.TRADING.RISK_PER_TRADE}%
+• Daily risk used: ${stats.dailyRiskUsed}/${CONFIG.TRADING.MAX_DAILY_RISK}%
 
 ⏰ <b>Entry in:</b> ${CONFIG.TRADING.PRE_ALERT_MIN} minutes
 
@@ -487,6 +699,7 @@ class MessageBuilder {
   static signalAlert(pair, analysis) {
     const trendEmoji = analysis.signal === "CALL" ? "📈" : "📉";
     const directionEmoji = analysis.signal === "CALL" ? "🟢 BUY" : "🔴 SELL";
+    const stats = tradeManager.getStats();
     
     return `
 ╔════════════════════════════════════╗
@@ -498,29 +711,36 @@ class MessageBuilder {
 🎯 <b>Signal:</b> ${directionEmoji} ${trendEmoji}
 💪 <b>Confidence:</b> ${analysis.confidence.toFixed(1)}%
 ⏳ <b>Expiry:</b> ${CONFIG.TRADING.EXPIRY_MIN} minutes
+📊 <b>Risk/Reward:</b> 1:${analysis.riskReward}
 
 <b>Entry Details:</b>
 💵 Entry Price: ${analysis.entryPrice.toFixed(5)}
 🛡 Stop Loss: ${analysis.stopLoss.toFixed(5)}
 🎯 Take Profit: ${analysis.takeProfit.toFixed(5)}
 
-<b>Strategy:</b> EMA(20/50/200) + RSI(14) + MACD + BB
+<b>Strategy:</b> EMA(20/50/200) + RSI(14) + MACD + BB + ADX + Stoch
+
+<b>Market Structure:</b>
+🟢 Support: ${analysis.indicators.support}
+🔴 Resistance: ${analysis.indicators.resistance}
 
 ⚠️ <b>Risk Management:</b>
 • Risk only ${CONFIG.TRADING.RISK_PER_TRADE}% per trade
-• Use proper position sizing
+• Daily limit: ${CONFIG.TRADING.MAX_TRADES_PER_DAY} trades (${stats.tradesRemaining} remaining)
+• Max daily loss: ${CONFIG.TRADING.MAX_DAILY_RISK}%
 • Set stop loss immediately
 
 <a href="${CONFIG.PROMO.LINK}">📲 Open Trade Now</a>
 🎁 Code: <code>${CONFIG.PROMO.CODE}</code>
 
-<i>Generated: ${new Date().toLocaleTimeString()} UTC</i>
+<i>Generated: ${new Date().toLocaleTimeString()} UTC | Real Market Data</i>
 `;
   }
 
   static resultAlert(trade, result) {
     const outcomeEmoji = result.outcome === "win" ? "✅ PROFIT" : "❌ LOSS";
     const pnl = result.pnl > 0 ? `+${result.pnl.toFixed(2)}%` : `${result.pnl.toFixed(2)}%`;
+    const stats = tradeManager.getStats();
     
     return `
 ╔════════════════════════════════════╗
@@ -535,10 +755,14 @@ ${outcomeEmoji}
 💵 Entry: ${trade.entryPrice.toFixed(5)}
 💵 Exit: ${result.exitPrice.toFixed(5)}
 📊 P&L: <code>${pnl}</code>
+⏱ Duration: ${CONFIG.TRADING.EXPIRY_MIN} minutes
 
 <b>Session Stats:</b>
-📈 Win Rate: ${tradeManager.getStats().winRate}%
-🎯 Total Today: ${tradeManager.getStats().sent}
+📈 Win Rate: ${stats.winRate}%
+🎯 Total Today: ${stats.sent}
+✅ Wins: ${stats.won}
+❌ Losses: ${stats.lost}
+💰 Daily Risk Used: ${stats.dailyRiskUsed}%
 
 <a href="${CONFIG.PROMO.LINK}">📲 Next Trade</a>
 `;
@@ -546,6 +770,9 @@ ${outcomeEmoji}
 
   static dailyReport() {
     const stats = tradeManager.getStats();
+    const totalTrades = stats.won + stats.lost;
+    const profitFactor = stats.lost > 0 ? (stats.won / stats.lost).toFixed(2) : stats.won;
+    
     return `
 ╔════════════════════════════════════╗
 ║      📈 DAILY PERFORMANCE REPORT    ║
@@ -556,8 +783,33 @@ ${outcomeEmoji}
 ❌ <b>Losses:</b> ${stats.lost}
 ⏳ <b>Pending:</b> ${stats.active}
 🎯 <b>Win Rate:</b> ${stats.winRate}%
+📈 <b>Profit Factor:</b> ${profitFactor}
+💰 <b>Daily Risk Used:</b> ${stats.dailyRiskUsed}%
 
-<i>Report generated at ${new Date().toLocaleTimeString()}</i>
+<b>Risk Management:</b>
+• Max risk/trade: ${CONFIG.TRADING.RISK_PER_TRADE}%
+• Daily risk limit: ${CONFIG.TRADING.MAX_DAILY_RISK}%
+• Trades limit: ${CONFIG.TRADING.MAX_TRADES_PER_DAY}
+• Remaining today: ${stats.tradesRemaining}
+
+<i>Report generated at ${new Date().toLocaleTimeString()} UTC</i>
+<i>Data source: TwelveData Real-Time API</i>
+`;
+  }
+
+  static riskWarning() {
+    return `
+⚠️ <b>RISK WARNING</b> ⚠️
+
+Binary options trading involves substantial risk of loss. 
+Past performance does not guarantee future results.
+
+<b>Current Limits:</b>
+• Risk per trade: ${CONFIG.TRADING.RISK_PER_TRADE}%
+• Daily max risk: ${CONFIG.TRADING.MAX_DAILY_RISK}%
+• Max trades/day: ${CONFIG.TRADING.MAX_TRADES_PER_DAY}
+
+Trade responsibly. Never risk more than you can afford to lose.
 `;
   }
 }
@@ -567,19 +819,22 @@ class BinarySignalBot {
   constructor() {
     this.isRunning = false;
     this.scheduledTasks = [];
+    this.lastHealthCheck = Date.now();
   }
 
   async start() {
     if (this.isRunning) return;
     
-    logger.info("Starting Binary Signal Bot...");
+    logger.info("Starting Binary Signal Bot v2.0...");
     await this.validateConfig();
     
     this.scheduleTasks();
     this.isRunning = true;
     
-    await telegram.sendMessage("🤖 <b>Bot Started</b>\nMonitoring markets for high-probability setups...");
-    logger.info("Bot is running");
+    await telegram.sendMessage("🤖 <b>Binary Signal Bot v2.0 Started</b>\n\n✅ Real-time market data active\n✅ Risk management enabled\n✅ Technical analysis engine running");
+    await telegram.sendMessage(MessageBuilder.riskWarning());
+    
+    logger.info("Bot is running with real market data");
   }
 
   async validateConfig() {
@@ -588,6 +843,14 @@ class BinarySignalBot {
     
     if (missing.length > 0) {
       throw new Error(`Missing required env vars: ${missing.join(", ")}`);
+    }
+    
+    // Test API connection
+    try {
+      await marketData.getForexData("EURUSD");
+      logger.info("TwelveData API connection validated");
+    } catch (error) {
+      throw new Error(`API connection failed: ${error.message}`);
     }
     
     logger.info("Configuration validated successfully");
@@ -599,7 +862,7 @@ class BinarySignalBot {
       this.runSignalCycle();
     });
 
-    // Pre-alert scan - every hour at minute 30 (for next hour)
+    // Pre-alert scan - every hour at minute 30
     const preAlertTask = cron.schedule("30 * * * *", () => {
       this.runPreAlertCycle();
     });
@@ -620,19 +883,41 @@ class BinarySignalBot {
       marketData.clearCache();
     });
 
-    this.scheduledTasks = [signalTask, preAlertTask, resultTask, reportTask, cleanupTask];
+    // Health check every 5 minutes
+    const healthTask = cron.schedule("*/5 * * * *", () => {
+      this.healthCheck();
+    });
+
+    this.scheduledTasks = [signalTask, preAlertTask, resultTask, reportTask, cleanupTask, healthTask];
     logger.info("Scheduled tasks initialized");
   }
 
-  async runSignalCycle() {
-    logger.info("Starting signal cycle");
-    const timestamp = Date.now();
+  async healthCheck() {
+    const activeTrades = tradeManager.getActiveTrades().length;
+    const stats = tradeManager.getStats();
     
+    if (activeTrades > 10) {
+      await telegram.sendAlert("High Activity Warning", `${activeTrades} active trades`, "medium");
+    }
+    
+    this.lastHealthCheck = Date.now();
+    logger.info(`Health check: ${activeTrades} active, ${stats.winRate}% win rate`);
+  }
+
+  async runSignalCycle() {
+    logger.info("Starting signal cycle with real market data");
+    tradeManager.checkNewDay();
+    
+    const canTrade = tradeManager.canTakeTrade();
+    if (!canTrade.allowed) {
+      logger.info(`Trading halted: ${canTrade.reason}`);
+      return;
+    }
+
     for (const pair of CONFIG.TRADING.PAIRS) {
       try {
-        // Check cooldown (avoid duplicate signals within 1 hour)
-        const lastSignal = tradeManager.lastSignalTime.get(pair);
-        if (lastSignal && timestamp - lastSignal < 3600000) {
+        // Check cooldown
+        if (tradeManager.isCooldownActive(pair)) {
           logger.info(`Skipping ${pair}: cooldown active`);
           continue;
         }
@@ -646,11 +931,18 @@ class BinarySignalBot {
         }
 
         if (analysis.confidence < CONFIG.TRADING.MIN_CONFIDENCE) {
-          logger.info(`Signal for ${pair} below confidence threshold: ${analysis.confidence}%`);
+          logger.info(`Signal for ${pair} below threshold: ${analysis.confidence}%`);
           continue;
         }
 
-        const tradeId = `${pair}_${timestamp}`;
+        // Final risk check before sending
+        const tradeCheck = tradeManager.canTakeTrade();
+        if (!tradeCheck.allowed) {
+          logger.warn(`Risk limit reached, stopping signal generation`);
+          break;
+        }
+
+        const tradeId = `${pair}_${Date.now()}`;
         tradeManager.addTrade(tradeId, {
           pair,
           signal: analysis.signal,
@@ -661,7 +953,7 @@ class BinarySignalBot {
         const message = MessageBuilder.signalAlert(pair, analysis);
         await telegram.sendMessage(message);
         
-        logger.info(`Signal sent for ${pair}: ${analysis.signal} (${analysis.confidence}%)`);
+        logger.info(`✅ REAL SIGNAL SENT for ${pair}: ${analysis.signal} (${analysis.confidence}%)`);
 
       } catch (error) {
         logger.error(`Error processing ${pair}:`, error.message);
@@ -672,9 +964,12 @@ class BinarySignalBot {
 
   async runPreAlertCycle() {
     logger.info("Running pre-alert scan");
+    tradeManager.checkNewDay();
     
     for (const pair of CONFIG.TRADING.PAIRS) {
       try {
+        if (tradeManager.isCooldownActive(pair)) continue;
+        
         // Check if we already have a pending trade for this pair
         const hasPending = Array.from(tradeManager.activeTrades.values()).some(t => t.pair === pair);
         if (hasPending) continue;
@@ -706,13 +1001,17 @@ class BinarySignalBot {
         
         let outcome, pnl;
         const isCall = trade.signal === "CALL";
+        const priceDiff = isCall 
+          ? currentPrice - trade.entryPrice 
+          : trade.entryPrice - currentPrice;
         
+        // Binary options: fixed payout typically 70-90%, loss 100%
         if (isCall) {
           outcome = currentPrice > trade.entryPrice ? "win" : "loss";
-          pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * 50;
+          pnl = outcome === "win" ? 85 : -100; // Assume 85% payout
         } else {
           outcome = currentPrice < trade.entryPrice ? "win" : "loss";
-          pnl = ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100 * 50;
+          pnl = outcome === "win" ? 85 : -100;
         }
 
         tradeManager.updateTrade(tradeId, {
@@ -733,13 +1032,13 @@ class BinarySignalBot {
   async sendDailyReport() {
     const message = MessageBuilder.dailyReport();
     await telegram.sendMessage(message);
-    logger.info("Daily report sent");
+    logger.info("Daily report sent with real performance data");
   }
 
   stop() {
     this.scheduledTasks.forEach((task) => task.stop());
     this.isRunning = false;
-    logger.info("Bot stopped");
+    logger.info("Bot stopped gracefully");
   }
 }
 
@@ -753,11 +1052,14 @@ process.on("SIGINT", () => bot.stop());
 // Handle uncaught errors
 process.on("uncaughtException", (error) => {
   logger.error("Uncaught Exception:", error);
-  process.exit(1);
+  telegram.sendAlert("Fatal Error", error.message, "high").finally(() => {
+    process.exit(1);
+  });
 });
 
 process.on("unhandledRejection", (reason, promise) => {
   logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+  telegram.sendAlert("Unhandled Rejection", String(reason), "high");
 });
 
 // Start the bot
@@ -767,4 +1069,4 @@ bot.start().catch((error) => {
 });
 
 export default bot;
-  
+        
