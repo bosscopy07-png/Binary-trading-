@@ -930,8 +930,6 @@ class BinarySignalBot {
     await telegram.sendMessage("🤖 <b>Binary Signal Bot v2.0 Started</b>\n\n✅ Real-time market data active\n✅ Risk management enabled\n✅ Technical analysis engine running");
     await telegram.sendMessage(MessageBuilder.riskWarning());
 
-    await this.testSignal("EURUSD");
-    
     logger.info("Bot is running with real market data");
   }
 
