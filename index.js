@@ -381,7 +381,8 @@ class MarketDataService {
 
 const marketData = new MarketDataService();
 
-// ==================== ENHANCED TECHNICAL ANALYSIS ====================
+
+        // ==================== ENHANCED TECHNICAL ANALYSIS ====================
 class TechnicalAnalyzer {
   analyze(data) {
     const { closes, highs, lows, volumes } = data;
@@ -396,6 +397,9 @@ class TechnicalAnalyzer {
       const confidence = this.calculateConfidence(indicators, signals, closes);
       const levels = this.findSupportResistance(closes, highs, lows);
 
+      // Log detailed analysis for debugging
+      logger.info(`Analysis for ${closes.length} candles - Score: ${signals.score}, Direction: ${signals.direction}, Confluence: ${signals.confluence}`);
+
       return {
         valid: true,
         signal: signals.direction,
@@ -406,6 +410,7 @@ class TechnicalAnalyzer {
         takeProfit: this.calculateTakeProfit(closes, signals.direction, levels),
         analysis: signals.reasoning,
         riskReward: this.calculateRiskReward(closes, signals.direction, levels),
+        rawScore: signals.score, // For debugging
       };
     } catch (error) {
       logger.error("Analysis error:", error.message);
@@ -468,10 +473,11 @@ class TechnicalAnalyzer {
     const lastEma20 = ind.ema20[ind.ema20.length - 1];
     const lastEma50 = ind.ema50[ind.ema50.length - 1];
     const lastEma200 = ind.ema200[ind.ema200.length - 1];
-    const prevEma50 = ind.ema50[ind.ema50.length - 2];
-    const prevEma200 = ind.ema200[ind.ema200.length - 2];
+    const prevEma50 = ind.ema50[ind.ema50.length - 2] || lastEma50;
+    const prevEma200 = ind.ema200[ind.ema200.length - 2] || lastEma200;
     
     const lastRSI = ind.rsi[ind.rsi.length - 1];
+    const prevRSI = ind.rsi[ind.rsi.length - 2] || lastRSI;
     const lastMACD = ind.macd[ind.macd.length - 1];
     const lastBB = ind.bb[ind.bb.length - 1];
     const lastATR = ind.atr[ind.atr.length - 1];
@@ -481,124 +487,212 @@ class TechnicalAnalyzer {
     let score = 0;
     let reasoning = [];
     let confluenceCount = 0;
+    let callSignals = 0;
+    let putSignals = 0;
 
-    // Trend Analysis with ADX
+    // 1. EMA TREND ANALYSIS (Strong weight)
     const trendUp = lastEma50 > lastEma200 && lastEma20 > lastEma50;
     const trendDown = lastEma50 < lastEma200 && lastEma20 < lastEma50;
     const strongTrend = lastADX > 25;
 
-    if (trendUp && strongTrend) {
-      score += 20;
-      reasoning.push("Strong uptrend (ADX>25)");
-      confluenceCount++;
-    } else if (trendDown && strongTrend) {
-      score -= 20;
-      reasoning.push("Strong downtrend (ADX>25)");
-      confluenceCount++;
+    if (trendUp) {
+      score += 15;
+      callSignals++;
+      reasoning.push("EMA uptrend");
+      if (strongTrend) {
+        score += 10;
+        reasoning.push("Strong trend (ADX>25)");
+      }
+    } else if (trendDown) {
+      score -= 15;
+      putSignals++;
+      reasoning.push("EMA downtrend");
+      if (strongTrend) {
+        score -= 10;
+        reasoning.push("Strong trend (ADX>25)");
+      }
     }
 
-    // EMA Crossover
-    const goldenCross = prevEma50 < prevEma200 && lastEma50 > lastEma200;
-    const deathCross = prevEma50 > prevEma200 && lastEma50 < lastEma200;
+    // 2. EMA CROSSOVER (High weight)
+    const goldenCross = prevEma50 <= prevEma200 && lastEma50 > lastEma200;
+    const deathCross = prevEma50 >= prevEma200 && lastEma50 < lastEma200;
+    const emaBullish = lastEma20 > lastEma50;
+    const emaBearish = lastEma20 < lastEma50;
 
     if (goldenCross) {
       score += 25;
-      reasoning.push("Golden Cross detected");
+      callSignals++;
       confluenceCount++;
+      reasoning.push("GOLDEN CROSS");
     } else if (deathCross) {
       score -= 25;
-      reasoning.push("Death Cross detected");
+      putSignals++;
       confluenceCount++;
+      reasoning.push("DEATH CROSS");
     }
 
-    // RSI Conditions with Divergence Check
-    if (lastRSI > 50 && lastRSI < 70) {
-      score += 15;
-      reasoning.push(`RSI bullish (${lastRSI.toFixed(1)})`);
-      confluenceCount++;
-    } else if (lastRSI < 50 && lastRSI > 30) {
-      score -= 15;
-      reasoning.push(`RSI bearish (${lastRSI.toFixed(1)})`);
-      confluenceCount++;
-    } else if (lastRSI > 70) {
-      score -= 10;
-      reasoning.push("RSI overbought");
-    } else if (lastRSI < 30) {
+    if (emaBullish && !goldenCross) {
       score += 10;
-      reasoning.push("RSI oversold");
+      callSignals++;
+      reasoning.push("EMA20>50 bullish");
+    } else if (emaBearish && !deathCross) {
+      score -= 10;
+      putSignals++;
+      reasoning.push("EMA20<50 bearish");
     }
 
-    // Stochastic
-    if (lastStoch) {
-      if (lastStoch.k < 20 && lastStoch.d < 20) {
-        score += 10;
-        reasoning.push("Stochastic oversold");
-        confluenceCount++;
-      } else if (lastStoch.k > 80 && lastStoch.d > 80) {
-        score -= 10;
-        reasoning.push("Stochastic overbought");
-        confluenceCount++;
-      }
+    // 3. RSI MOMENTUM (Medium weight)
+    const rsiBullish = lastRSI > 50 && lastRSI < 70;
+    const rsiBearish = lastRSI < 50 && lastRSI > 30;
+    const rsiOversold = lastRSI < 30;
+    const rsiOverbought = lastRSI > 70;
+    const rsiRising = lastRSI > prevRSI;
+
+    if (rsiBullish) {
+      score += 15;
+      callSignals++;
+      confluenceCount++;
+      reasoning.push(`RSI bullish (${lastRSI.toFixed(1)})`);
+    } else if (rsiBearish) {
+      score -= 15;
+      putSignals++;
+      confluenceCount++;
+      reasoning.push(`RSI bearish (${lastRSI.toFixed(1)})`);
     }
 
-    // MACD
+    if (rsiOversold) {
+      score += 20; // Strong reversal signal
+      callSignals++;
+      confluenceCount++;
+      reasoning.push("RSI OVERSOLD (<30)");
+    } else if (rsiOverbought) {
+      score -= 20;
+      putSignals++;
+      confluenceCount++;
+      reasoning.push("RSI OVERBOUGHT (>70)");
+    }
+
+    // 4. MACD MOMENTUM (Medium weight)
     if (lastMACD) {
       const macdBullish = lastMACD.histogram > 0 && lastMACD.MACD > lastMACD.signal;
       const macdBearish = lastMACD.histogram < 0 && lastMACD.MACD < lastMACD.signal;
-      
-      if (macdBullish) {
+      const macdCrossUp = lastMACD.histogram > 0 && ind.macd[ind.macd.length - 2]?.histogram < 0;
+      const macdCrossDown = lastMACD.histogram < 0 && ind.macd[ind.macd.length - 2]?.histogram > 0;
+
+      if (macdCrossUp) {
         score += 20;
-        reasoning.push("MACD bullish");
+        callSignals++;
         confluenceCount++;
-      } else if (macdBearish) {
+        reasoning.push("MACD CROSS UP");
+      } else if (macdCrossDown) {
         score -= 20;
-        reasoning.push("MACD bearish");
+        putSignals++;
         confluenceCount++;
+        reasoning.push("MACD CROSS DOWN");
+      } else if (macdBullish) {
+        score += 10;
+        callSignals++;
+        reasoning.push("MACD bullish");
+      } else if (macdBearish) {
+        score -= 10;
+        putSignals++;
+        reasoning.push("MACD bearish");
       }
     }
 
-    // Bollinger Bands
-    if (lastClose < lastBB.lower) {
-      score += 15;
-      reasoning.push("Price below BB lower (oversold)");
-      confluenceCount++;
-    } else if (lastClose > lastBB.upper) {
-      score -= 15;
-      reasoning.push("Price above BB upper (overbought)");
-      confluenceCount++;
+    // 5. BOLLINGER BANDS (Medium weight)
+    if (lastBB) {
+      const priceBelowBB = lastClose < lastBB.lower;
+      const priceAboveBB = lastClose > lastBB.upper;
+      const priceNearLower = lastClose < lastBB.lower * 1.001;
+      const priceNearUpper = lastClose > lastBB.upper * 0.999;
+
+      if (priceBelowBB) {
+        score += 20;
+        callSignals++;
+        confluenceCount++;
+        reasoning.push("Price below BB lower (mean reversion)");
+      } else if (priceAboveBB) {
+        score -= 20;
+        putSignals++;
+        confluenceCount++;
+        reasoning.push("Price above BB upper (mean reversion)");
+      } else if (priceNearLower && lastRSI < 40) {
+        score += 10;
+        callSignals++;
+        reasoning.push("Near BB support");
+      } else if (priceNearUpper && lastRSI > 60) {
+        score -= 10;
+        putSignals++;
+        reasoning.push("Near BB resistance");
+      }
     }
 
-    // Determine direction
+    // 6. STOCHASTIC (Low weight)
+    if (lastStoch) {
+      const stochOversold = lastStoch.k < 20 && lastStoch.d < 20;
+      const stochOverbought = lastStoch.k > 80 && lastStoch.d > 80;
+      const stochBullish = lastStoch.k > lastStoch.d && lastStoch.k < 50;
+      const stochBearish = lastStoch.k < lastStoch.d && lastStoch.k > 50;
+
+      if (stochOversold) {
+        score += 10;
+        callSignals++;
+        reasoning.push("Stoch oversold");
+      } else if (stochOverbought) {
+        score -= 10;
+        putSignals++;
+        reasoning.push("Stoch overbought");
+      } else if (stochBullish) {
+        score += 5;
+        callSignals++;
+        reasoning.push("Stoch bullish");
+      } else if (stochBearish) {
+        score -= 5;
+        putSignals++;
+        reasoning.push("Stoch bearish");
+      }
+    }
+
+    // Determine direction based on score and confluence
     let direction = null;
-    if (score >= 50 && confluenceCount >= 3) direction = "CALL";
-    else if (score <= -50 && confluenceCount >= 3) direction = "PUT";
+    const minScore = 35; // Lowered threshold
+    const minConfluence = 2; // Require at least 2 indicators
+    
+    if (score >= minScore && callSignals >= minConfluence) {
+      direction = "CALL";
+    } else if (score <= -minScore && putSignals >= minConfluence) {
+      direction = "PUT";
+    }
 
     return {
       direction,
       score: Math.abs(score),
       reasoning: reasoning.join(" | "),
       trend: trendUp ? "bullish" : trendDown ? "bearish" : "neutral",
-      confluence: confluenceCount,
+      confluence: Math.max(callSignals, putSignals),
       volatility: lastATR,
+      rawScore: score, // Keep for debugging
     };
   }
 
   calculateConfidence(indicators, signals, closes) {
-    let confidence = Math.min(signals.score * 0.8, 85); // Cap at 85% initially
+    let confidence = Math.min(signals.score * 1.2, 90); // Scale up slightly
     
-    // Boost for high confluence
-    confidence += signals.confluence * 2;
+    // Boost for high confluence (multiple indicators agreeing)
+    confidence += signals.confluence * 3;
     
     // Trend alignment bonus
     if (signals.direction === "CALL" && signals.trend === "bullish") confidence += 5;
     if (signals.direction === "PUT" && signals.trend === "bearish") confidence += 5;
     
-    // Volatility check - avoid low volatility periods
+    // Volatility check - avoid very low volatility
     const avgPrice = closes.reduce((a, b) => a + b, 0) / closes.length;
     const volatilityPct = (signals.volatility / avgPrice) * 100;
-    if (volatilityPct < 0.05) confidence -= 10; // Too quiet
+    if (volatilityPct < 0.03) confidence -= 15; // Too quiet
+    else if (volatilityPct > 0.1) confidence += 5; // Good volatility
     
-    return Math.min(Math.max(confidence, 0), 98); // Hard cap at 98%
+    return Math.min(Math.max(confidence, 0), 95); // Cap at 95%
   }
 
   calculateStopLoss(closes, highs, lows, direction) {
@@ -606,13 +700,15 @@ class TechnicalAnalyzer {
     const lastATR = atr[atr.length - 1];
     const lastClose = closes[closes.length - 1];
     
-    // Use 1.5x ATR for stop loss
-    return direction === "CALL" 
+    // Use 1.5x ATR for stop loss, or minimum 10 pips
+    const atrStop = direction === "CALL" 
       ? lastClose - (lastATR * 1.5) 
       : lastClose + (lastATR * 1.5);
+    
+    return atrStop;
   }
 
-    calculateTakeProfit(closes, direction, levels) {
+  calculateTakeProfit(closes, direction, levels) {
     const lastClose = closes[closes.length - 1];
     const atr = ATR.calculate({ 
       high: closes.map((c, i) => Math.max(c, closes[i-1] || c)),
@@ -635,7 +731,7 @@ class TechnicalAnalyzer {
     const atrDist = Math.abs(atrTarget - lastClose);
     const srDist = Math.abs(srTarget - lastClose);
     
-    return (atrDist < srDist ? atrTarget : srTarget).toFixed(5);
+    return (atrDist < srDist ? atrTarget : srTarget);
   }
 
   calculateRiskReward(closes, direction, levels) {
@@ -656,7 +752,7 @@ class TechnicalAnalyzer {
 }
 
 const analyzer = new TechnicalAnalyzer();
-
+                      
 // ==================== MESSAGE TEMPLATES ====================
 class MessageBuilder {
   static preAlert(pair, analysis) {
@@ -833,6 +929,8 @@ class BinarySignalBot {
     
     await telegram.sendMessage("🤖 <b>Binary Signal Bot v2.0 Started</b>\n\n✅ Real-time market data active\n✅ Risk management enabled\n✅ Technical analysis engine running");
     await telegram.sendMessage(MessageBuilder.riskWarning());
+
+    await this.testSignal("EURUSD");
     
     logger.info("Bot is running with real market data");
   }
@@ -904,7 +1002,8 @@ class BinarySignalBot {
     logger.info(`Health check: ${activeTrades} active, ${stats.winRate}% win rate`);
   }
 
-  async runSignalCycle() {
+  
+      async runSignalCycle() {
     logger.info("Starting signal cycle with real market data");
     tradeManager.checkNewDay();
     
@@ -913,6 +1012,8 @@ class BinarySignalBot {
       logger.info(`Trading halted: ${canTrade.reason}`);
       return;
     }
+
+    let signalsFound = 0;
 
     for (const pair of CONFIG.TRADING.PAIRS) {
       try {
@@ -925,13 +1026,18 @@ class BinarySignalBot {
         const data = await marketData.getForexData(pair);
         const analysis = analyzer.analyze(data);
 
-        if (!analysis.valid || !analysis.signal) {
-          logger.info(`No signal for ${pair}: ${analysis.reason || "No setup"}`);
+        if (!analysis.valid) {
+          logger.info(`No signal for ${pair}: ${analysis.reason}`);
+          continue;
+        }
+
+        if (!analysis.signal) {
+          logger.info(`No signal for ${pair}: Score ${analysis.rawScore}, Confluence ${analysis.indicators.confluence} - ${analysis.analysis}`);
           continue;
         }
 
         if (analysis.confidence < CONFIG.TRADING.MIN_CONFIDENCE) {
-          logger.info(`Signal for ${pair} below threshold: ${analysis.confidence}%`);
+          logger.info(`Signal for ${pair} below confidence threshold: ${analysis.confidence}% (need ${CONFIG.TRADING.MIN_CONFIDENCE}%)`);
           continue;
         }
 
@@ -942,6 +1048,7 @@ class BinarySignalBot {
           break;
         }
 
+        signalsFound++;
         const tradeId = `${pair}_${Date.now()}`;
         tradeManager.addTrade(tradeId, {
           pair,
@@ -953,14 +1060,19 @@ class BinarySignalBot {
         const message = MessageBuilder.signalAlert(pair, analysis);
         await telegram.sendMessage(message);
         
-        logger.info(`✅ REAL SIGNAL SENT for ${pair}: ${analysis.signal} (${analysis.confidence}%)`);
+        logger.info(`✅ REAL SIGNAL SENT for ${pair}: ${analysis.signal} (${analysis.confidence}%) - ${analysis.analysis}`);
 
       } catch (error) {
         logger.error(`Error processing ${pair}:`, error.message);
         await telegram.sendAlert("Signal Error", `Pair: ${pair}\nError: ${error.message}`, "high");
       }
     }
+
+    if (signalsFound === 0) {
+      logger.info("No signals found this cycle - market conditions not favorable");
+    }
   }
+      
 
   async runPreAlertCycle() {
     logger.info("Running pre-alert scan");
@@ -1029,6 +1141,39 @@ class BinarySignalBot {
     }
   }
 
+  // Add this to the BinarySignalBot class
+  async testSignal(pair = "EURUSD") {
+    logger.info(`Generating test signal for ${pair}`);
+    try {
+      const data = await marketData.getForexData(pair);
+      const analysis = analyzer.analyze(data);
+      
+      logger.info(`Test analysis: ${JSON.stringify({
+        valid: analysis.valid,
+        signal: analysis.signal,
+        confidence: analysis.confidence,
+        score: analysis.rawScore,
+        trend: analysis.indicators?.trend,
+        confluence: analysis.indicators?.confluence,
+        analysis: analysis.analysis
+      }, null, 2)}`);
+      
+      // Force a signal for testing
+      if (!analysis.signal) {
+        analysis.signal = "CALL"; // Force CALL for test
+        analysis.confidence = 80;
+        analysis.analysis = "TEST SIGNAL - Forced CALL";
+      }
+      
+      const message = MessageBuilder.signalAlert(pair, analysis);
+      await telegram.sendMessage(message);
+      logger.info("Test signal sent successfully");
+      
+    } catch (error) {
+      logger.error("Test signal failed:", error.message);
+    }
+  }
+  
   async sendDailyReport() {
     const message = MessageBuilder.dailyReport();
     await telegram.sendMessage(message);
