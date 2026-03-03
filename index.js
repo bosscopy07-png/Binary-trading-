@@ -424,8 +424,6 @@ class TechnicalAnalyzer {
       ema50: EMA.calculate({ period: 50, values: closes }),
       ema200: EMA.calculate({ period: 200, values: closes }),
       rsi: RSI.calculate({ period: 14, values: closes }),
-      rsi7: RSI.calculate({ period: 7, values: closes }),
-      bb: BollingerBands.calculate({ period: 20, values: closes, stdDev: 2 }),
       macd: MACD.calculate({
         values: closes,
         fastPeriod: 12,
@@ -436,6 +434,11 @@ class TechnicalAnalyzer {
       }),
       atr: ATR.calculate({ high: highs, low: lows, close: closes, period: 14 }),
       adx: ADX.calculate({ high: highs, low: lows, close: closes, period: 14 }),
+      bb: BollingerBands.calculate({
+        period: 20,
+        values: closes,
+        stdDev: 2,
+      }),
       stochastic: Stochastic.calculate({
         high: highs,
         low: lows,
@@ -443,6 +446,8 @@ class TechnicalAnalyzer {
         period: 14,
         signalPeriod: 3,
       }),
+      avgVolume:
+        volumes.reduce((a, b) => a + b, 0) / volumes.length,
     };
   }
 
