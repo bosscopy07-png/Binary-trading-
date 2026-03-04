@@ -14,7 +14,7 @@ const CONFIG = {
     TOKEN: process.env.BOT_TOKEN,
     CHAT_ID: process.env.CHANNEL_ID,
     ADMIN_ID: process.env.ADMIN_CHAT_ID || null,
-    RATE_LIMIT_MS: 1000, // 1 message per second to same chat
+    RATE_LIMIT_MS: 3000, // 1 message per second to same chat
   },
   TRADING: {
     PAIRS: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "XAUUSD"],
@@ -22,9 +22,9 @@ const CONFIG = {
     EXPIRY_MIN: 60,
     PRE_ALERT_MIN: 30,
     MIN_CONFIDENCE: 75,
-    RISK_PER_TRADE: 0.5, // Conservative: 0.5% per trade
-    MAX_DAILY_RISK: 3.0, // Max 3% daily loss
-    MAX_TRADES_PER_DAY: 5, // Prevent overtrading
+    RISK_PER_TRADE: 10, // Conservative: 0.5% per trade
+    MAX_DAILY_RISK: 100, // Max 3% daily loss
+    MAX_TRADES_PER_DAY: 10, // Prevent overtrading
     COOLDOWN_MIN: 60, // Minutes between signals for same pair
   },
   PROMO: {
@@ -197,7 +197,7 @@ class TelegramService {
       };
 
       const response = await axios.post(`${this.baseUrl}/sendMessage`, payload, {
-        timeout: 10000,
+        timeout: 15000,
       });
       
       logger.info(`Message sent successfully to ${payload.chat_id}`);
@@ -206,7 +206,7 @@ class TelegramService {
       if (error.response?.status === 429) {
         const retryAfter = error.response.data?.parameters?.retry_after || 35;
         logger.warn(`Rate limited by Telegram. Retry after ${retryAfter}s`);
-        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        await new Promise(r => setTimeout(r, retryAfter * 3000));
         return this.sendMessage(text, options); // Retry once
       }
       
