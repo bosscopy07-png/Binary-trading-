@@ -18,13 +18,13 @@ const CONFIG = {
   },
   TRADING: {
     PAIRS: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "XAUUSD"],
-    TIMEFRAME: "1 Hour (H1)",
-    EXPIRY_MIN: 60,
+    TIMEFRAME: "30 Min (30M), 1 Hour (H1)",
+    EXPIRY_MIN: 30,
     PRE_ALERT_MIN: 30,
     MIN_CONFIDENCE: 75,
     RISK_PER_TRADE: 10, // Conservative: 0.5% per trade
-    MAX_DAILY_RISK: 100, // Max 3% daily loss
-    MAX_TRADES_PER_DAY: 10, // Prevent overtrading
+    MAX_DAILY_RISK: 5, // Max 3% daily loss
+    MAX_TRADES_PER_DAY: 5, // Prevent overtrading
     COOLDOWN_MIN: 60, // Minutes between signals for same pair
   },
   PROMO: {
