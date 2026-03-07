@@ -22,7 +22,7 @@ const CONFIG = {
     EXPIRY_MIN: 30,
     PRE_ALERT_MIN: 30,
     MIN_CONFIDENCE: 75,
-    RISK_PER_TRADE: 10, // Conservative: 0.5% per trade
+    RISK_PER_TRADE: 1.5, // Conservative: 0.5% per trade
     MAX_DAILY_RISK: 5, // Max 3% daily loss
     MAX_TRADES_PER_DAY: 5, // Prevent overtrading
     COOLDOWN_MIN: 60, // Minutes between signals for same pair
